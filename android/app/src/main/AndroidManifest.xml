@@ -7,7 +7,7 @@
 
 
     <application
-        android:label="voice_app"
+        android:label="VoiceScan"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
 

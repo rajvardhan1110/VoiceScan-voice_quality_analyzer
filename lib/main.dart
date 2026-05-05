@@ -3,13 +3,15 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:audio_streamer/audio_streamer.dart';
+import 'package:record/record.dart'; 
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:audioplayers/audioplayers.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:intl/intl.dart';
 
-void main() => runApp(const MaterialApp(
-      home: VoiceHomePage(),
-      debugShowCheckedModeBanner: false,
-    ));
+void main() => runApp(const MaterialApp(home: VoiceHomePage(), debugShowCheckedModeBanner: false));
 
 class VoiceHomePage extends StatefulWidget {
   const VoiceHomePage({super.key});
@@ -20,245 +22,274 @@ class VoiceHomePage extends StatefulWidget {
 class _VoiceHomePageState extends State<VoiceHomePage> {
   Interpreter? _interpreter;
   StreamSubscription<List<double>>? _audioSub;
-
-  String _statusText = "Press Start to Record";
+  final List<double> _aiBuffer = [];
+  final AudioRecorder _originalRecorder = AudioRecorder();
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  
   bool _isRecording = false;
-  bool _isSafe = false;
+  bool _isOverallSafe = true; 
+  String _statusText = "Ready";
+  String _currentClassName = "Silence";
   double _currentAmplitude = 0.0;
-  String _debugInfo = "";
-  List<bool> _safeHistory = []; // store safe/not safe for entire session
+  List<bool> _safeHistory = []; 
+  List<Map<String, dynamic>> _recordings = [];
+  String? _playingPath;
 
-  static const int _requiredSamples = 15600;
-  final List<double> _buffer = [];
-  DateTime _lastRun = DateTime.now();
-
-  // Safe class indices (Speech + minor background sounds, breathing removed)
-  final Set<int> _safeClasses = {
-    0, 1, 2, 3, 4, 5, 12, 13, 14, 19, 62, 63, 104, 132
-  };
+  final Set<int> _safeClasses = {0,1,2,3,4,5,12,13,14,62,63,104,132};
 
   @override
   void initState() {
     super.initState();
-    _initialize();
+    _initAI();
+    _audioPlayer.onPlayerStateChanged.listen((s) {
+      if (s == PlayerState.completed) setState(() => _playingPath = null);
+    });
   }
 
-  Future<void> _initialize() async {
-    var status = await Permission.microphone.request();
-    if (status.isGranted) {
-      try {
-        _interpreter = await Interpreter.fromAsset('assets/models/yamnet.tflite');
-        print("✅ YAMNet READY");
-      } catch (e) {
-        setState(() {
-          _statusText = "❌ Model Error: $e";
-        });
-      }
-    } else {
-      setState(() {
-        _statusText = "❌ Microphone Permission Denied";
-      });
-    }
+  Future<void> _initAI() async {
+    await Permission.microphone.request();
+    _interpreter = await Interpreter.fromAsset('assets/models/yamnet.tflite');
   }
 
-  void _startRecording() {
+  Future<void> _startDualRecording() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final path = "${dir.path}/rec_${DateTime.now().millisecondsSinceEpoch}.m4a";
+
     setState(() {
       _isRecording = true;
-      _statusText = "Recording...";
-      _debugInfo = "";
+      _isOverallSafe = true;
       _safeHistory.clear();
-      _buffer.clear();
+      _aiBuffer.clear();
+      _statusText = "Monitoring...";
     });
 
-    _audioSub = AudioStreamer().audioStream.listen((List<double> samples) {
+    await _originalRecorder.start(const RecordConfig(), path: path);
+
+    _audioSub = AudioStreamer().audioStream.listen((samples) {
       double maxAmp = samples.fold(0.0, (prev, e) => max(prev, e.abs()));
       setState(() => _currentAmplitude = maxAmp);
 
-      _buffer.addAll(samples);
+      _aiBuffer.addAll(samples);
 
-      if (_buffer.length >= _requiredSamples) {
-        final now = DateTime.now();
-        if (now.difference(_lastRun).inMilliseconds > 150) {
-          final input = Float32List.fromList(
-              _buffer.sublist(_buffer.length - _requiredSamples));
-          _runInference(input);
-          _lastRun = now;
-        }
-        if (_buffer.length > _requiredSamples * 2) {
-          _buffer.removeRange(0, _buffer.length - _requiredSamples);
-        }
+      if (_aiBuffer.length >= 15600) {
+        _runAI(Float32List.fromList(_aiBuffer.sublist(0, 15600)));
+        _aiBuffer.removeRange(0, 15600);
       }
     });
   }
 
-  void _stopRecording() {
+  Future<void> _stopDualRecording() async {
     _audioSub?.cancel();
-    _audioSub = null;
+    final path = await _originalRecorder.stop();
+
+    int safeCount = _safeHistory.where((val) => val).length;
+    double safePercent = _safeHistory.isEmpty ? 0 : (safeCount / _safeHistory.length) * 100;
+
+    bool sessionSafe = safePercent > 75;
+
     setState(() {
       _isRecording = false;
+      _isOverallSafe = sessionSafe;
+      _statusText = sessionSafe ? "✅ Good Quality" : "❌ Poor Quality";
 
-      // Calculate overall session safety
-      if (_safeHistory.isNotEmpty) {
-        int safeCount = _safeHistory.where((s) => s).length;
-        double safeRatio = safeCount / _safeHistory.length;
-        _isSafe = safeRatio > 0.5; // >50% of session is safe
-        _statusText = _isSafe ? "✅ OVERALL SAFE" : "❌ OVERALL NOT SAFE";
-      } else {
-        _statusText = "❌ NO AUDIO DETECTED";
-        _isSafe = false;
+      if (path != null) {
+        _recordings.insert(0, {
+          "path": path,
+          "time": DateFormat('hh:mm a').format(DateTime.now()),
+          "safePercent": safePercent.toInt(),
+          "isSafe": sessionSafe
+        });
       }
     });
   }
 
-  void _runInference(Float32List input) {
+  void _runAI(Float32List input) {
     if (_interpreter == null) return;
 
-    // Normalize input
-    double maxVal = input.fold(0.0, (m, e) => max(m, e.abs()));
-    for (int i = 0; i < input.length; i++) {
-      input[i] = input[i] / (maxVal > 0.001 ? maxVal : 1.0);
-      input[i] = input[i].clamp(-1.0, 1.0);
-    }
-
     var output = [List.filled(521, 0.0)];
-    try {
-      _interpreter!.run(input, output);
-      List<double> scores = output[0];
+    _interpreter!.run(input, output);
 
-      double maxProb = scores.reduce(max);
-      int maxIndex = scores.indexOf(maxProb);
-      double speechScore = scores[0];
+    double prob = output[0].reduce(max);
+    int idx = output[0].indexOf(prob);
 
-      bool isSilence = maxProb < 0.08 || _currentAmplitude < 0.01;
-      bool isSafeNow = !isSilence &&
-          (_safeClasses.contains(maxIndex) || (speechScore > 0.05 && maxProb < 0.85));
+    bool isSilence = _currentAmplitude < 0.10;
+    bool isTooLoud = _currentAmplitude > 0.55;
+    bool isClassSafe = _safeClasses.contains(idx);
 
-      _safeHistory.add(isSafeNow);
-
-      // Update UI for live recording
-      if (_isRecording) {
-        setState(() {
-          _debugInfo =
-              "Class:$maxIndex ${_getClassName(maxIndex)} ${(maxProb*100).toStringAsFixed(0)}% "
-              "Speech:${(speechScore*100).toStringAsFixed(0)}%";
-          _statusText = isSilence
-              ? "❌ SILENCE"
-              : (isSafeNow ? "✅ SAFE" : "❌ NOT SAFE");
-        });
-      }
-
-      print(
-          "🎯 $maxIndex (${_getClassName(maxIndex)}) ${maxProb.toStringAsFixed(2)} "
-          "Speech:${speechScore.toStringAsFixed(3)} "
-          "${isSilence ? '🔇SILENCE' : isSafeNow ? '✅SAFE' : '❌NOT SAFE'} "
-          "Amp:${(_currentAmplitude*100).toStringAsFixed(0)}%");
-    } catch (e) {
-      print("Error: $e");
+    bool isSafeNow;
+    if (isSilence) {
+      isSafeNow = true;
+    } else if (isTooLoud) {
+      isSafeNow = false;
+    } else {
+      isSafeNow = isClassSafe;
     }
+
+    _safeHistory.add(isSafeNow);
+
+    setState(() {
+      _currentClassName = _getName(idx);
+
+      if (_isRecording) {
+        if (isTooLoud) {
+          _statusText = "⚠️ TOO LOUD";
+        } else if (isSilence) {
+          _statusText = "🔇 SILENT";
+        } else {
+          _statusText = isSafeNow ? "✅ Good Quality" : "❌ Poor Quality";
+        }
+      }
+    });
   }
 
-  String _getClassName(int index) {
-    Map<int, String> classNames = {
+  String _getName(int i) {
+    Map<int, String> names = {
       0: "Speech",
-      1: "Child speech",
-      2: "Conversation",
-      3: "Narration",
-      4: "Babbling",
-      5: "Speech Synth",
-      12: "Whispering",
+      6: "SHOUTING",
+      7: "YELLING",
       13: "Laughter",
-      14: "Baby laughter",
-      19: "Crying",
-      62: "Hubbub",
-      63: "Children playing",
-      104: "Water",
-      132: "Click",
-      34: "Breathing",
-      294: "Breathing",
+      62: "Crowded Noise",
+      137: "Music"
     };
-    return classNames[index] ?? "Class $index";
+    return names[i] ?? "Sound ($i)";
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _isSafe ? Colors.green.shade400 : Colors.red.shade500,
-      body: Padding(
-        padding: const EdgeInsets.all(30),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              _isSafe ? Icons.check_circle : Icons.mic_off,
-              size: 160,
-              color: Colors.white,
-            ),
-            const SizedBox(height: 40),
-            Text(
-              _statusText,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 32,
-                fontWeight: FontWeight.bold,
+      body: Stack(
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: _isRecording
+                    ? [Color(0xFF232526), Color(0xFF414345)]
+                    : (_isOverallSafe
+                        ? [Color(0xFF0B3D2E), Color(0xFF1F7A5C)]
+                        : [Color(0xFF8E0E00), Color(0xFF1F1C18)]),
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
               ),
-              textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 30),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(25),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(20),
+          ),
+
+          Center(
+            child: Opacity(
+              opacity: 0.12,
+              child: Image.asset(
+                "assets/ic_launcher.png",
+                scale: 0.4
+                // fit: BoxFit.cover,
               ),
-              child: Column(
-                children: [
-                  Text(
-                    "📊 Vol: ${(_currentAmplitude*100).toStringAsFixed(0)}%",
-                    style: const TextStyle(color: Colors.white, fontSize: 20),
-                  ),
-                  const SizedBox(height: 15),
-                  Text(
-                    _debugInfo,
-                    style: const TextStyle(color: Colors.white70, fontSize: 16),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 20),
-                  ElevatedButton(
-                    onPressed:
-                        _isRecording ? _stopRecording : _startRecording,
-                    style: ElevatedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 50, vertical: 15),
-                        backgroundColor: Colors.blueAccent),
-                    child: Text(
-                      _isRecording ? "Stop Recording" : "Start Recording",
-                      style: const TextStyle(fontSize: 20),
+            ),
+          ),
+
+          Column(
+            children: [
+              const SizedBox(height: 60),
+
+              Container(
+                margin: const EdgeInsets.symmetric(horizontal: 20),
+                padding: const EdgeInsets.all(25),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.05),
+                  borderRadius: BorderRadius.circular(25),
+                  border: Border.all(color: Colors.white24),
+                ),
+                child: Column(
+                  children: [
+                    Text(_statusText,
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 10),
+
+                    Text("Detected: $_currentClassName",
+                        style: const TextStyle(color: Colors.white70)),
+
+                    const SizedBox(height: 20),
+
+                    LinearProgressIndicator(
+                      value: _currentAmplitude * 1.5,
+                      minHeight: 12,
+                      backgroundColor: Colors.white12,
+                      color: _currentAmplitude > 0.55
+                          ? Colors.red
+                          : Colors.greenAccent,
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                  const Text(
-                    "✅ SAFE = Voice / minor background\n❌ NOT SAFE = All others (incl. Breathing)",
-                    style: TextStyle(
-                      color: Color(0xFFFFD700),
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                ],
+
+                    const SizedBox(height: 10),
+                    Text("VOL: ${(_currentAmplitude * 100).toInt()}%",
+                        style: const TextStyle(color: Colors.white70)),
+                  ],
+                ),
               ),
-            ),
-          ],
-        ),
+
+              const SizedBox(height: 40),
+
+              GestureDetector(
+                onTap: _isRecording ? _stopDualRecording : _startDualRecording,
+                child: Container(
+                  padding: const EdgeInsets.all(25),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _isRecording ? Colors.redAccent : Colors.blueAccent,
+                  ),
+                  child: Icon(
+                    _isRecording ? Icons.stop : Icons.mic,
+                    size: 50,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 20),
+
+              const Text("SESSION HISTORY",
+                  style: TextStyle(color: Colors.white54)),
+
+              Expanded(
+                child: ListView.builder(
+                  itemCount: _recordings.length,
+                  itemBuilder: (context, i) {
+                    final rec = _recordings[i];
+                    bool isPlaying = _playingPath == rec['path'];
+
+                    return ListTile(
+                      title: Text("${rec['safePercent']}% Clarity",
+                          style: const TextStyle(color: Colors.white)),
+                      subtitle: Text(rec['time'],
+                          style: const TextStyle(color: Colors.white38)),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: Icon(isPlaying ? Icons.stop : Icons.play_arrow, color: Colors.blueAccent),
+                            onPressed: () async {
+                              if (isPlaying) {
+                                await _audioPlayer.stop();
+                                setState(() => _playingPath = null);
+                              } else {
+                                await _audioPlayer.play(DeviceFileSource(rec['path']));
+                                setState(() => _playingPath = rec['path']);
+                              }
+                            },
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.share, color: Colors.white70),
+                            onPressed: () => Share.shareXFiles([XFile(rec['path'])]),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
-  }
-
-  @override
-  void dispose() {
-    _audioSub?.cancel();
-    _interpreter?.close();
-    super.dispose();
   }
 }
