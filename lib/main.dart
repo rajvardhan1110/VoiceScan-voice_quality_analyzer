@@ -19,6 +19,7 @@ class VoiceHomePage extends StatefulWidget {
   State<VoiceHomePage> createState() => _VoiceHomePageState();
 }
 
+
 class _VoiceHomePageState extends State<VoiceHomePage> {
   Interpreter? _interpreter;
   StreamSubscription<List<double>>? _audioSub;
